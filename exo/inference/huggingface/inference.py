@@ -30,36 +30,44 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             print(f"Loading shard {shard} for HuggingFace distributed engine")
 
         try:
+            # Enhanced loading with better error handling
             full_model = AutoModelForCausalLM.from_pretrained(
                 shard.model_id,
                 torch_dtype=torch.float16,
-                device_map="cpu",  # Keep on CPU initially
+                device_map="cpu",
                 trust_remote_code=True,
                 use_safetensors=True,
                 low_cpu_mem_usage=True,
             )
+
             if DEBUG >= 2:
                 print(f"Successfully loaded model: {type(full_model)}")
                 print(
                     f"Model config: {getattr(full_model, 'config', 'No config found')}"
                 )
+
         except Exception as e:
             if DEBUG >= 1:
                 print(f"Error loading model with safetensors: {e}")
+            # Fallback loading without safetensors
             full_model = AutoModelForCausalLM.from_pretrained(
                 shard.model_id,
                 torch_dtype=torch.float16,
-                device_map="cpu",  # Keep on CPU initially
+                device_map="cpu",
                 trust_remote_code=True,
+                use_safetensors=False,
             )
 
+        # Extract relevant layers for this shard
         shard_layers = self._extract_layers(full_model, shard)
 
+        # Move to GPU and store
         if torch.cuda.is_available() and self.device == "cuda":
             self.model_shards[shard] = shard_layers.to(self.device)
         else:
             self.model_shards[shard] = shard_layers
 
+        # Clean up full model
         del full_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -71,7 +79,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         """Extract specific layers for the shard"""
         layers = nn.ModuleList()
 
-        # Debug: Print model structure for troubleshooting
+        # Enhanced debugging output
         if DEBUG >= 2:
             print(f"Model type: {type(model)}")
             print(f"Model class name: {model.__class__.__name__}")
@@ -80,6 +88,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 print(
                     f"Model architecture: {getattr(model.config, 'architectures', 'Unknown')}"
                 )
+                print(f"Model name: {getattr(model.config, 'model_type', 'Unknown')}")
 
         # Enhanced Llama-style detection with multiple variants
         if hasattr(model, "model") and hasattr(model.model, "layers"):
@@ -93,6 +102,9 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 print(
                     f"Detected Llama-style architecture with {len(model_layers)} layers"
                 )
+                print(f"Embed layer: {type(embed_layer) if embed_layer else 'None'}")
+                print(f"Norm layer: {type(norm_layer) if norm_layer else 'None'}")
+                print(f"LM head: {type(lm_head) if lm_head else 'None'}")
 
         elif hasattr(model, "model") and hasattr(model.model, "h"):
             # Alternative Llama structure variant
@@ -136,23 +148,65 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                     f"Detected direct layers architecture with {len(model_layers)} layers"
                 )
 
+        # Additional fallback for complex model structures
+        elif hasattr(model, "model"):
+            # Try to find layers in nested model structure
+            model_obj = model.model
+            possible_layer_attrs = ["layers", "h", "decoder_layers", "encoder_layers"]
+
+            model_layers = None
+            for attr in possible_layer_attrs:
+                if hasattr(model_obj, attr):
+                    model_layers = getattr(model_obj, attr)
+                    if DEBUG >= 2:
+                        print(
+                            f"Found layers via fallback: {attr} with {len(model_layers)} layers"
+                        )
+                    break
+
+            if model_layers is None:
+                # Last resort - check what attributes the model actually has
+                available_attrs = [
+                    attr for attr in dir(model_obj) if not attr.startswith("_")
+                ]
+                raise ValueError(
+                    f"Could not find transformer layers in model {shard.model_id}. "
+                    f"Model.model attributes: {available_attrs[:10]}..."
+                )
+
+            # Find embedding and output layers
+            embed_layer = getattr(model_obj, "embed_tokens", None) or getattr(
+                model_obj, "wte", None
+            )
+            norm_layer = getattr(model_obj, "norm", None) or getattr(
+                model_obj, "ln_f", None
+            )
+            lm_head = getattr(model, "lm_head", None)
+
         else:
             # Enhanced error with detailed model information
             available_attrs = [attr for attr in dir(model) if not attr.startswith("_")]
-            model_attrs = {
-                attr: type(getattr(model, attr))
-                for attr in ["model", "transformer", "layers"]
-                if hasattr(model, attr)
-            }
+            model_structure = {}
+
+            # Analyze model structure
+            for attr in ["model", "transformer", "layers"]:
+                if hasattr(model, attr):
+                    nested_obj = getattr(model, attr)
+                    nested_attrs = [
+                        a for a in dir(nested_obj) if not a.startswith("_")
+                    ][:5]
+                    model_structure[attr] = (
+                        f"{type(nested_obj)} with attrs: {nested_attrs}"
+                    )
 
             error_msg = (
                 f"Unsupported model architecture for {shard.model_id}. "
                 f"Model type: {type(model)}. "
-                f"Available model attributes: {model_attrs}. "
-                f"All attributes: {available_attrs[:15]}..."
+                f"Available attributes: {available_attrs[:15]}. "
+                f"Structure analysis: {model_structure}"
             )
 
-            # Try to provide more helpful debugging info
+            # Add config information if available
             if hasattr(model, "config"):
                 error_msg += f" Config: {model.config}"
 
@@ -161,6 +215,10 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         # Validate that we found the necessary components
         if not model_layers:
             raise ValueError(f"No transformer layers found in model {shard.model_id}")
+
+        if DEBUG >= 2:
+            print(f"Total layers found: {len(model_layers)}")
+            print(f"Shard range: {shard.start_layer} to {shard.end_layer}")
 
         # Handle first layer (embeddings)
         if shard.is_first_layer() and embed_layer is not None:
