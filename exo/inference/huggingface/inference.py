@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from transformers import AutoModelForCausalLM
 from exo.inference.inference_engine import InferenceEngine
 from exo.inference.shard import Shard
-from exo.inference.tokenizers import resolve_tokenizer
+from transformers import AutoTokenizer
 from exo.download.shard_download import ShardDownloader
 from exo.helpers import DEBUG
 
@@ -428,7 +428,12 @@ class HuggingFaceDistributedEngine(InferenceEngine):
     async def _get_tokenizer(self, model_id: str):
         """Get tokenizer for the model"""
         if model_id not in self.tokenizer_cache:
-            self.tokenizer_cache[model_id] = await resolve_tokenizer(model_id)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                force_download=True,  # Force fresh download
+                local_files_only=False,  # Ensure remote access
+            )
+            self.tokenizer_cache[model_id] = tokenizer
         return self.tokenizer_cache[model_id]
 
     def _get_device(self):
