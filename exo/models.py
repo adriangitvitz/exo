@@ -5,7 +5,7 @@ model_cards = {
     "smollm2-1.7b": {
         "layers": 24,
         "repo": {
-            "HuggingFaceDistributedEngine": "HuggingFaceTB/SmolLM2-1.7B-Instruct",  # Add this
+            "HuggingFaceDistributedEngine": "HuggingFaceTB/SmolLM2-1.7B",  # Add this
         },
     },
     ### llama
