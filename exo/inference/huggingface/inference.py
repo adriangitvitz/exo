@@ -29,12 +29,29 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         if DEBUG >= 2:
             print(f"Loading shard {shard} for HuggingFace distributed engine")
 
-        full_model = AutoModelForCausalLM.from_pretrained(
-            shard.model_id,
-            torch_dtype=torch.float16,
-            device_map="cpu",  # Keep on CPU initially
-            trust_remote_code=True,
-        )
+        try:
+            full_model = AutoModelForCausalLM.from_pretrained(
+                shard.model_id,
+                torch_dtype=torch.float16,
+                device_map="cpu",  # Keep on CPU initially
+                trust_remote_code=True,
+                use_safetensors=True,
+                low_cpu_mem_usage=True,
+            )
+            if DEBUG >= 2:
+                print(f"Successfully loaded model: {type(full_model)}")
+                print(
+                    f"Model config: {getattr(full_model, 'config', 'No config found')}"
+                )
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"Error loading model with safetensors: {e}")
+            full_model = AutoModelForCausalLM.from_pretrained(
+                shard.model_id,
+                torch_dtype=torch.float16,
+                device_map="cpu",  # Keep on CPU initially
+                trust_remote_code=True,
+            )
 
         shard_layers = self._extract_layers(full_model, shard)
 
@@ -54,34 +71,131 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         """Extract specific layers for the shard"""
         layers = nn.ModuleList()
 
+        # Debug: Print model structure for troubleshooting
+        if DEBUG >= 2:
+            print(f"Model type: {type(model)}")
+            print(f"Model class name: {model.__class__.__name__}")
+            if hasattr(model, "config"):
+                print(f"Model config type: {type(model.config)}")
+                print(
+                    f"Model architecture: {getattr(model.config, 'architectures', 'Unknown')}"
+                )
+
+        # Enhanced Llama-style detection with multiple variants
         if hasattr(model, "model") and hasattr(model.model, "layers"):
+            # Standard Llama architecture (Llama-2, Llama-3, etc.)
             model_layers = model.model.layers
             embed_layer = getattr(model.model, "embed_tokens", None)
             norm_layer = getattr(model.model, "norm", None)
             lm_head = getattr(model, "lm_head", None)
+
+            if DEBUG >= 2:
+                print(
+                    f"Detected Llama-style architecture with {len(model_layers)} layers"
+                )
+
+        elif hasattr(model, "model") and hasattr(model.model, "h"):
+            # Alternative Llama structure variant
+            model_layers = model.model.h
+            embed_layer = getattr(model.model, "embed_tokens", None) or getattr(
+                model.model, "wte", None
+            )
+            norm_layer = getattr(model.model, "norm", None) or getattr(
+                model.model, "ln_f", None
+            )
+            lm_head = getattr(model, "lm_head", None)
+
+            if DEBUG >= 2:
+                print(
+                    f"Detected Llama-h-style architecture with {len(model_layers)} layers"
+                )
+
         elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+            # GPT-style architecture
             model_layers = model.transformer.h
             embed_layer = getattr(model.transformer, "wte", None)
             norm_layer = getattr(model.transformer, "ln_f", None)
             lm_head = getattr(model, "lm_head", None)
-        else:
-            raise ValueError(f"Unsupported model architecture for {shard.model_id}")
 
+            if DEBUG >= 2:
+                print(
+                    f"Detected GPT-style architecture with {len(model_layers)} layers"
+                )
+
+        elif hasattr(model, "layers"):
+            # Direct layers access (some model variants)
+            model_layers = model.layers
+            embed_layer = getattr(model, "embed_tokens", None) or getattr(
+                model, "wte", None
+            )
+            norm_layer = getattr(model, "norm", None) or getattr(model, "ln_f", None)
+            lm_head = getattr(model, "lm_head", None)
+
+            if DEBUG >= 2:
+                print(
+                    f"Detected direct layers architecture with {len(model_layers)} layers"
+                )
+
+        else:
+            # Enhanced error with detailed model information
+            available_attrs = [attr for attr in dir(model) if not attr.startswith("_")]
+            model_attrs = {
+                attr: type(getattr(model, attr))
+                for attr in ["model", "transformer", "layers"]
+                if hasattr(model, attr)
+            }
+
+            error_msg = (
+                f"Unsupported model architecture for {shard.model_id}. "
+                f"Model type: {type(model)}. "
+                f"Available model attributes: {model_attrs}. "
+                f"All attributes: {available_attrs[:15]}..."
+            )
+
+            # Try to provide more helpful debugging info
+            if hasattr(model, "config"):
+                error_msg += f" Config: {model.config}"
+
+            raise ValueError(error_msg)
+
+        # Validate that we found the necessary components
+        if not model_layers:
+            raise ValueError(f"No transformer layers found in model {shard.model_id}")
+
+        # Handle first layer (embeddings)
         if shard.is_first_layer() and embed_layer is not None:
             layers.append(embed_layer)
+            if DEBUG >= 3:
+                print(f"Added embedding layer: {type(embed_layer)}")
 
+        # Extract transformer layers for this shard
         start_idx = max(0, shard.start_layer)
         end_idx = min(len(model_layers), shard.end_layer + 1)
+
+        if DEBUG >= 2:
+            print(
+                f"Extracting layers {start_idx} to {end_idx - 1} from {len(model_layers)} total layers"
+            )
 
         for i in range(start_idx, end_idx):
             if i < len(model_layers):
                 layers.append(model_layers[i])
+                if DEBUG >= 3:
+                    print(f"Added layer {i}: {type(model_layers[i])}")
 
+        # Handle last layer (output projection)
         if shard.is_last_layer():
             if norm_layer is not None:
                 layers.append(norm_layer)
+                if DEBUG >= 3:
+                    print(f"Added norm layer: {type(norm_layer)}")
             if lm_head is not None:
                 layers.append(lm_head)
+                if DEBUG >= 3:
+                    print(f"Added LM head: {type(lm_head)}")
+
+        if DEBUG >= 2:
+            print(f"Total layers extracted for shard: {len(layers)}")
 
         return layers
 
