@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from transformers import AutoModelForCausalLM
 from exo.inference.inference_engine import InferenceEngine
 from exo.inference.shard import Shard
-from transformers import AutoTokenizer
+from exo.inference.tokenizers import resolve_tokenizer
 from exo.download.shard_download import ShardDownloader
 from exo.helpers import DEBUG
 
@@ -428,11 +428,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
     async def _get_tokenizer(self, model_id: str):
         """Get tokenizer for the model"""
         if model_id not in self.tokenizer_cache:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_id,
-                force_download=True,  # Force fresh download
-                local_files_only=False,  # Ensure remote access
-            )
+            tokenizer = await resolve_tokenizer(model_id)
+            tokenizer.chat_template = """{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"""
             self.tokenizer_cache[model_id] = tokenizer
         return self.tokenizer_cache[model_id]
 
