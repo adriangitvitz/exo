@@ -19,8 +19,18 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         self.tokenizer_cache = {}
         self.device = device
         self.executor = ThreadPoolExecutor(max_workers=1)
-
+        self._current_shard = None
         self.session = {}
+
+    @property
+    def shard(self):
+        """Expose current shard for Exo framework compatibility"""
+        return self._current_shard
+
+    @shard.setter
+    def shard(self, value):
+        """Set current shard"""
+        self._current_shard = value
 
     @property
     def tokenizer(self):
@@ -47,17 +57,30 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
     async def ensure_shard(self, shard: Shard):
         if shard in self.model_shards:
+            self._current_shard = shard  # Add this line
             return
 
         if DEBUG >= 2:
             print(f"Loading shard {shard} for HuggingFace distributed engine")
 
-        full_model = AutoModelForCausalLM.from_pretrained(
-            shard.model_id,
-            torch_dtype=torch.float16,
-            device_map="cpu",
-            trust_remote_code=True,
-        )
+        try:
+            full_model = AutoModelForCausalLM.from_pretrained(
+                shard.model_id,
+                torch_dtype=torch.float16,
+                device_map="cpu",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+            )
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"Error loading model: {e}")
+            full_model = AutoModelForCausalLM.from_pretrained(
+                shard.model_id,
+                torch_dtype=torch.float16,
+                device_map="cpu",
+                trust_remote_code=True,
+                use_safetensors=False,
+            )
 
         await self.get_or_load_tokenizer(shard.model_id)
 
@@ -67,6 +90,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             self.model_shards[shard] = shard_layers.to(self.device)
         else:
             self.model_shards[shard] = shard_layers
+
+        self._current_shard = shard
 
         del full_model
         if torch.cuda.is_available():
@@ -93,6 +118,9 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 print(
                     f"Detected Llama-style architecture with {len(model_layers)} layers"
                 )
+                print(f"Embed layer: {embed_layer}")
+                print(f"Norm layer: {norm_layer}")
+                print(f"LM head: {lm_head}")
 
         elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
             model_layers = model.transformer.h
@@ -120,6 +148,9 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
         start_idx = max(0, shard.start_layer)
         end_idx = min(len(model_layers), shard.end_layer + 1)
+
+        if DEBUG >= 2:
+            print(f"Extracting layers {start_idx} to {end_idx - 1}")
 
         for i in range(start_idx, end_idx):
             if i < len(model_layers):
@@ -227,6 +258,9 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         prompt: str,
         inference_state: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
+        """Infer from a text prompt"""
+        self._current_shard = shard
+
         await self.get_or_load_tokenizer(shard.model_id)
 
         tokens = await self.encode(shard, prompt)
@@ -246,6 +280,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         """Process tensor through assigned layers"""
         await self.ensure_shard(shard)
 
+        self._current_shard = shard
+
         if inference_state is None:
             inference_state = {}
 
@@ -254,6 +290,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 raise ValueError(f"Input data is None for shard {shard}")
 
             if isinstance(input_data, np.ndarray):
+                if input_data.size == 0:
+                    raise ValueError(f"Input data is empty for shard {shard}")
                 x = torch.from_numpy(input_data).to(self.device)
             else:
                 x = input_data.to(self.device)
@@ -261,10 +299,16 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             if x is None:
                 raise ValueError(f"Converted tensor is None for shard {shard}")
 
+            if x.dim() == 1:
+                x = x.unsqueeze(0)
+            elif x.dim() == 0:
+                raise ValueError(f"Scalar tensor not supported for shard {shard}")
+
             layers = self.model_shards[shard]
 
             for i, layer in enumerate(layers):
                 layer_name = layer.__class__.__name__
+
                 if DEBUG >= 3:
                     print(f"Processing layer {i}: {layer_name}, input shape: {x.shape}")
 
@@ -273,39 +317,80 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                         f"Tensor became None before layer {i} ({layer_name})"
                     )
 
-                if hasattr(layer, "forward"):
-                    if "embed" in layer_name.lower():
-                        x = layer(x.long())
-                    elif "norm" in layer_name.lower():
-                        x = layer(x)
-                    elif (
-                        "lm_head" in layer_name.lower() or "head" in layer_name.lower()
-                    ):
-                        x = layer(x)
-                    else:
-                        try:
+                try:
+                    if hasattr(layer, "forward"):
+                        if "embed" in layer_name.lower():
+                            x = layer(x.long())
+                        elif "norm" in layer_name.lower():
                             x = layer(x)
-                            if isinstance(x, tuple):
-                                x = x[0]
-                        except Exception as e:
-                            if DEBUG >= 1:
-                                print(f"Error in layer {i} ({layer_name}): {e}")
-                            try:
-                                seq_len = x.shape[1]
+                        elif (
+                            "lm_head" in layer_name.lower()
+                            or "head" in layer_name.lower()
+                        ):
+                            x = layer(x)
+                        else:
+                            if (
+                                "decoder" in layer_name.lower()
+                                or "llama" in layer_name.lower()
+                            ):
+                                batch_size, seq_len = x.shape[:2]
                                 attention_mask = torch.ones(
-                                    x.shape[0], seq_len, device=x.device
+                                    batch_size, seq_len, device=x.device, dtype=x.dtype
                                 )
-                                x = layer(x, attention_mask=attention_mask)
-                                if isinstance(x, tuple):
-                                    x = x[0]
-                            except Exception as e2:
-                                print(f"Failed to recover from layer error: {e2}")
-                                raise e
-                else:
-                    x = layer(x)
 
-                if x is None:
-                    raise ValueError(f"Layer {i} ({layer_name}) returned None")
+                                try:
+                                    result = layer(x, attention_mask=attention_mask)
+                                    if isinstance(result, tuple):
+                                        x = result[0]  # Take hidden states
+                                    else:
+                                        x = result
+                                except TypeError:
+                                    result = layer(x)
+                                    if isinstance(result, tuple):
+                                        x = result[0]
+                                    else:
+                                        x = result
+                            else:
+                                result = layer(x)
+                                if isinstance(result, tuple):
+                                    x = result[0]
+                                else:
+                                    x = result
+                    else:
+                        x = layer(x)
+
+                    if x is None:
+                        raise ValueError(f"Layer {i} ({layer_name}) returned None")
+
+                    if not hasattr(x, "shape"):
+                        raise ValueError(
+                            f"Layer {i} ({layer_name}) returned object without shape attribute"
+                        )
+
+                except Exception as e:
+                    if DEBUG >= 1:
+                        print(f"Error in layer {i} ({layer_name}): {e}")
+                        print(f"Input shape: {x.shape if x is not None else 'None'}")
+                        print(f"Layer type: {type(layer)}")
+
+                    if "shape" in str(e) and x is not None:
+                        try:
+                            if x.dim() < 2:
+                                x = x.unsqueeze(0)
+                            elif x.dim() > 3:
+                                x = x.view(x.shape[0], x.shape[1], -1)
+
+                            result = layer(x)
+                            if isinstance(result, tuple):
+                                x = result[0]
+                            else:
+                                x = result
+
+                        except Exception as e2:
+                            print(f"Failed to recover from layer error: {e2}")
+                            raise e
+                    else:
+                        raise e
 
             return x.cpu().numpy()
 
