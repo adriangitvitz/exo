@@ -57,7 +57,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
     async def ensure_shard(self, shard: Shard):
         if shard in self.model_shards:
-            self._current_shard = shard  # Add this line
+            self._current_shard = shard
             return
 
         if DEBUG >= 2:
@@ -70,6 +70,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 device_map="cpu",
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
+                use_cache=False,
+                output_attentions=False,
             )
         except Exception as e:
             if DEBUG >= 1:
@@ -80,10 +82,11 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 device_map="cpu",
                 trust_remote_code=True,
                 use_safetensors=False,
+                use_cache=False,
+                output_attentions=False,
             )
 
         await self.get_or_load_tokenizer(shard.model_id)
-
         shard_layers = self._extract_layers(full_model, shard)
 
         if torch.cuda.is_available() and self.device == "cuda":
@@ -92,7 +95,6 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             self.model_shards[shard] = shard_layers
 
         self._current_shard = shard
-
         del full_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -277,9 +279,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         input_data: np.ndarray,
         inference_state: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
-        """Process tensor through assigned layers"""
+        """Process tensor through assigned layers with proper LlamaDecoderLayer support"""
         await self.ensure_shard(shard)
-
         self._current_shard = shard
 
         if inference_state is None:
@@ -296,15 +297,27 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             else:
                 x = input_data.to(self.device)
 
-            if x is None:
-                raise ValueError(f"Converted tensor is None for shard {shard}")
-
             if x.dim() == 1:
                 x = x.unsqueeze(0)
             elif x.dim() == 0:
                 raise ValueError(f"Scalar tensor not supported for shard {shard}")
 
             layers = self.model_shards[shard]
+            batch_size, seq_len = x.shape[:2]
+
+            position_ids = torch.arange(seq_len, dtype=torch.long, device=x.device)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, seq_len)
+
+            attention_mask = torch.ones(
+                batch_size, seq_len, dtype=torch.bool, device=x.device
+            )
+
+            causal_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=x.device),
+                diagonal=1,
+            )
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            causal_mask = causal_mask.expand(batch_size, 1, seq_len, seq_len)
 
             for i, layer in enumerate(layers):
                 layer_name = layer.__class__.__name__
@@ -328,34 +341,40 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                             or "head" in layer_name.lower()
                         ):
                             x = layer(x)
-                        else:
-                            if (
-                                "decoder" in layer_name.lower()
-                                or "llama" in layer_name.lower()
-                            ):
-                                batch_size, seq_len = x.shape[:2]
-                                attention_mask = torch.ones(
-                                    batch_size, seq_len, device=x.device, dtype=x.dtype
+                        elif (
+                            "llamadecoderlayer" in layer_name.lower()
+                            or "decoder" in layer_name.lower()
+                        ):
+                            try:
+                                result = layer(
+                                    hidden_states=x,
+                                    attention_mask=causal_mask,
+                                    position_ids=position_ids,
+                                    past_key_value=None,
+                                    output_attentions=False,
+                                    use_cache=False,
                                 )
 
-                                try:
-                                    result = layer(x, attention_mask=attention_mask)
-                                    if isinstance(result, tuple):
-                                        x = result[0]  # Take hidden states
-                                    else:
-                                        x = result
-                                except TypeError:
-                                    result = layer(x)
+                                if isinstance(result, tuple):
+                                    x = result[0]  # hidden_states
+                                else:
+                                    x = result
+
+                            except TypeError as e:
+                                if "unexpected keyword argument" in str(e):
+                                    result = layer(x, attention_mask=causal_mask)
                                     if isinstance(result, tuple):
                                         x = result[0]
                                     else:
                                         x = result
-                            else:
-                                result = layer(x)
-                                if isinstance(result, tuple):
-                                    x = result[0]
                                 else:
-                                    x = result
+                                    raise e
+                        else:
+                            result = layer(x)
+                            if isinstance(result, tuple):
+                                x = result[0]
+                            else:
+                                x = result
                     else:
                         x = layer(x)
 
@@ -380,7 +399,18 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                             elif x.dim() > 3:
                                 x = x.view(x.shape[0], x.shape[1], -1)
 
-                            result = layer(x)
+                            if "llamadecoderlayer" in layer_name.lower():
+                                result = layer(
+                                    hidden_states=x,
+                                    attention_mask=causal_mask,
+                                    position_ids=position_ids,
+                                    past_key_value=None,
+                                    output_attentions=False,
+                                    use_cache=False,
+                                )
+                            else:
+                                result = layer(x)
+
                             if isinstance(result, tuple):
                                 x = result[0]
                             else:
