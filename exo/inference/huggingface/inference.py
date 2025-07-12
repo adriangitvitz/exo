@@ -20,7 +20,10 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         self.device = device
         self.executor = ThreadPoolExecutor(max_workers=1)
         self._current_shard = None
-        self.mapper = {"qwen-2.5-3b": "Qwen/Qwen2.5-3B-Instruct"}
+        self.mapper = {
+            "qwen-2.5-3b": "Qwen/Qwen2.5-3B-Instruct",
+            "smollm2-1.7b": "HuggingFaceTB/SmolLM2-1.7B",
+        }
         self.session = {}
 
     @property
