@@ -22,6 +22,29 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
         self.session = {}
 
+    @property
+    def tokenizer(self):
+        """Expose tokenizer for Exo framework compatibility"""
+        if self.tokenizer_cache:
+            return next(iter(self.tokenizer_cache.values()))
+        return None
+
+    async def get_or_load_tokenizer(self, model_id: str):
+        """Get tokenizer and ensure it's accessible via the tokenizer property"""
+        if model_id not in self.tokenizer_cache:
+            tokenizer = await resolve_tokenizer(model_id)
+
+            # TODO: Change this
+            if "SmolLM2" in model_id and (
+                not hasattr(tokenizer, "chat_template")
+                or tokenizer.chat_template is None
+            ):
+                tokenizer.chat_template = """{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"""
+
+            self.tokenizer_cache[model_id] = tokenizer
+
+        return self.tokenizer_cache[model_id]
+
     async def ensure_shard(self, shard: Shard):
         if shard in self.model_shards:
             return
@@ -29,45 +52,22 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         if DEBUG >= 2:
             print(f"Loading shard {shard} for HuggingFace distributed engine")
 
-        try:
-            # Enhanced loading with better error handling
-            full_model = AutoModelForCausalLM.from_pretrained(
-                shard.model_id,
-                torch_dtype=torch.float16,
-                device_map="cpu",
-                trust_remote_code=True,
-                use_safetensors=True,
-                low_cpu_mem_usage=True,
-            )
+        full_model = AutoModelForCausalLM.from_pretrained(
+            shard.model_id,
+            torch_dtype=torch.float16,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
 
-            if DEBUG >= 2:
-                print(f"Successfully loaded model: {type(full_model)}")
-                print(
-                    f"Model config: {getattr(full_model, 'config', 'No config found')}"
-                )
+        await self.get_or_load_tokenizer(shard.model_id)
 
-        except Exception as e:
-            if DEBUG >= 1:
-                print(f"Error loading model with safetensors: {e}")
-            # Fallback loading without safetensors
-            full_model = AutoModelForCausalLM.from_pretrained(
-                shard.model_id,
-                torch_dtype=torch.float16,
-                device_map="cpu",
-                trust_remote_code=True,
-                use_safetensors=False,
-            )
-
-        # Extract relevant layers for this shard
         shard_layers = self._extract_layers(full_model, shard)
 
-        # Move to GPU and store
         if torch.cuda.is_available() and self.device == "cuda":
             self.model_shards[shard] = shard_layers.to(self.device)
         else:
             self.model_shards[shard] = shard_layers
 
-        # Clean up full model
         del full_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -227,7 +227,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         prompt: str,
         inference_state: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
-        """Infer from a text prompt"""
+        await self.get_or_load_tokenizer(shard.model_id)
+
         tokens = await self.encode(shard, prompt)
 
         if tokens.ndim == 1:
@@ -264,7 +265,6 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
             for i, layer in enumerate(layers):
                 layer_name = layer.__class__.__name__
-
                 if DEBUG >= 3:
                     print(f"Processing layer {i}: {layer_name}, input shape: {x.shape}")
 
@@ -314,7 +314,6 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 self.executor, _infer
             )
 
-            # Final validation
             if output_data is None:
                 raise ValueError(f"Final output is None for shard {shard}")
 
@@ -348,12 +347,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         await asyncio.get_running_loop().run_in_executor(self.executor, _save)
 
     async def _get_tokenizer(self, model_id: str):
-        """Get tokenizer for the model"""
-        if model_id not in self.tokenizer_cache:
-            tokenizer = await resolve_tokenizer(model_id)
-            tokenizer.chat_template = """{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"""
-            self.tokenizer_cache[model_id] = tokenizer
-        return self.tokenizer_cache[model_id]
+        return await self.get_or_load_tokenizer(model_id)
 
     def _get_device(self):
         """Get the current device"""
