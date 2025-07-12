@@ -20,6 +20,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         self.device = device
         self.executor = ThreadPoolExecutor(max_workers=1)
         self._current_shard = None
+        self.mapper = {"qwen-2.5-3b": "Qwen/Qwen2.5-3B-Instruct"}
         self.session = {}
 
     @property
@@ -40,6 +41,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         return None
 
     async def get_or_load_tokenizer(self, model_id: str):
+        model_id = self.mapper.get(model_id, model_id)
         """Get tokenizer and ensure it's accessible via the tokenizer property"""
         if model_id not in self.tokenizer_cache:
             tokenizer = await resolve_tokenizer(model_id)
@@ -60,6 +62,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             self._current_shard = shard
             return
 
+        shard.model_id = self.mapper.get(shard.model_id, "")
         if DEBUG >= 2:
             print(f"Loading shard {shard} for HuggingFace distributed engine")
 
@@ -106,6 +109,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         """Extract specific layers for the shard"""
         layers = nn.ModuleList()
 
+        shard.model_id = self.mapper.get(shard.model_id, "")
         if DEBUG >= 2:
             print(f"Model type: {type(model)}")
             print(f"Model class name: {model.__class__.__name__}")
@@ -171,6 +175,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
     async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
         """Encode prompt to tokens using the tokenizer"""
+        shard.model_id = self.mapper.get(shard.model_id, "")
         await self.ensure_shard(shard)
 
         tokenizer = await self._get_tokenizer(shard.model_id)
@@ -183,6 +188,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
     async def decode(self, shard: Shard, tokens: np.ndarray) -> str:
         """Decode tokens to text using the tokenizer"""
+
+        shard.model_id = self.mapper.get(shard.model_id, "")
         await self.ensure_shard(shard)
 
         tokenizer = await self._get_tokenizer(shard.model_id)
@@ -261,6 +268,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         inference_state: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
         """Infer from a text prompt"""
+        shard.model_id = self.mapper.get(shard.model_id, "")
         self._current_shard = shard
 
         await self.get_or_load_tokenizer(shard.model_id)
@@ -493,6 +501,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         await asyncio.get_running_loop().run_in_executor(self.executor, _save)
 
     async def _get_tokenizer(self, model_id: str):
+        model_id = self.mapper.get(model_id, model_id)
         return await self.get_or_load_tokenizer(model_id)
 
     def _get_device(self):
