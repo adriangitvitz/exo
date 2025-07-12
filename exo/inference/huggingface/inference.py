@@ -453,7 +453,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                     else:
                         raise e
 
-            return x.cpu().numpy()
+            return x.detach().cpu().numpy()
 
         try:
             output_data = await asyncio.get_running_loop().run_in_executor(
