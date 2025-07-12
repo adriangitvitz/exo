@@ -128,44 +128,46 @@ def generate_completion(
 def remap_messages(messages: List[Message]) -> List[Message]:
     remapped_messages = []
     last_image = None
+
     for message in messages:
         if not isinstance(message.content, list):
             remapped_messages.append(message)
             continue
 
+        # Extract text content from list format
+        text_content = ""
         remapped_content = []
+
         for content in message.content:
             if isinstance(content, dict):
-                if content.get("type") in ["image_url", "image"]:
+                if content.get("type") == "text":
+                    # Extract text content directly
+                    text_content += content.get("text", "")
+                elif content.get("type") in ["image_url", "image"]:
                     image_url = content.get("image_url", {}).get("url") or content.get(
                         "image"
                     )
                     if image_url:
                         last_image = {"type": "image", "image": image_url}
-                        remapped_content.append(
-                            {
-                                "type": "text",
-                                "text": "[An image was uploaded but is not displayed here]",
-                            }
+                        text_content += (
+                            "[An image was uploaded but is not displayed here]"
                         )
                 else:
-                    remapped_content.append(content)
+                    # Handle other content types
+                    if "text" in content:
+                        text_content += content["text"]
             else:
-                remapped_content.append(content)
-        remapped_messages.append(Message(role=message.role, content=remapped_content))
+                # Handle string content in list
+                text_content += str(content)
 
-    if last_image:
-        # Replace the last image placeholder with the actual image content
-        for message in reversed(remapped_messages):
-            for i, content in enumerate(message.content):
-                if isinstance(content, dict):
-                    if (
-                        content.get("type") == "text"
-                        and content.get("text")
-                        == "[An image was uploaded but is not displayed here]"
-                    ):
-                        message.content[i] = last_image
-                        return remapped_messages
+        # For text-only models like Qwen2.5, convert list content to string
+        if text_content and not last_image:
+            remapped_messages.append(Message(role=message.role, content=text_content))
+        else:
+            # Keep original format for multimodal content
+            remapped_messages.append(
+                Message(role=message.role, content=remapped_content)
+            )
 
     return remapped_messages
 
