@@ -62,13 +62,13 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             self._current_shard = shard
             return
 
-        shard.model_id = self.mapper.get(shard.model_id, "")
+        model_id = self.mapper.get(shard.model_id, "")
         if DEBUG >= 2:
             print(f"Loading shard {shard} for HuggingFace distributed engine")
 
         try:
             full_model = AutoModelForCausalLM.from_pretrained(
-                shard.model_id,
+                model_id,
                 torch_dtype=torch.float16,
                 device_map="cpu",
                 trust_remote_code=True,
@@ -80,7 +80,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             if DEBUG >= 1:
                 print(f"Error loading model: {e}")
             full_model = AutoModelForCausalLM.from_pretrained(
-                shard.model_id,
+                model_id,
                 torch_dtype=torch.float16,
                 device_map="cpu",
                 trust_remote_code=True,
@@ -89,7 +89,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 output_attentions=False,
             )
 
-        await self.get_or_load_tokenizer(shard.model_id)
+        await self.get_or_load_tokenizer(model_id)
         shard_layers = self._extract_layers(full_model, shard)
 
         if torch.cuda.is_available() and self.device == "cuda":
@@ -109,7 +109,7 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         """Extract specific layers for the shard"""
         layers = nn.ModuleList()
 
-        shard.model_id = self.mapper.get(shard.model_id, "")
+        model_id = self.mapper.get(shard.model_id, "")
         if DEBUG >= 2:
             print(f"Model type: {type(model)}")
             print(f"Model class name: {model.__class__.__name__}")
@@ -141,13 +141,13 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         else:
             available_attrs = [attr for attr in dir(model) if not attr.startswith("_")]
             raise ValueError(
-                f"Unsupported model architecture for {shard.model_id}. "
+                f"Unsupported model architecture for {model_id}. "
                 f"Model type: {type(model)}. "
                 f"Available attributes: {available_attrs[:10]}..."
             )
 
         if not model_layers:
-            raise ValueError(f"No transformer layers found in model {shard.model_id}")
+            raise ValueError(f"No transformer layers found in model {model_id}")
 
         if shard.is_first_layer() and embed_layer is not None:
             layers.append(embed_layer)
@@ -175,10 +175,10 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
     async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
         """Encode prompt to tokens using the tokenizer"""
-        shard.model_id = self.mapper.get(shard.model_id, "")
+        model_id = self.mapper.get(shard.model_id, "")
         await self.ensure_shard(shard)
 
-        tokenizer = await self._get_tokenizer(shard.model_id)
+        tokenizer = await self._get_tokenizer(model_id)
 
         def _encode():
             tokens = tokenizer.encode(prompt, return_tensors="pt")
@@ -189,10 +189,10 @@ class HuggingFaceDistributedEngine(InferenceEngine):
     async def decode(self, shard: Shard, tokens: np.ndarray) -> str:
         """Decode tokens to text using the tokenizer"""
 
-        shard.model_id = self.mapper.get(shard.model_id, "")
+        model_id = self.mapper.get(shard.model_id, "")
         await self.ensure_shard(shard)
 
-        tokenizer = await self._get_tokenizer(shard.model_id)
+        tokenizer = await self._get_tokenizer(model_id)
 
         def _decode():
             if isinstance(tokens, np.ndarray):
@@ -268,10 +268,10 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         inference_state: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
         """Infer from a text prompt"""
-        shard.model_id = self.mapper.get(shard.model_id, "")
+        model_id = self.mapper.get(shard.model_id, "")
         self._current_shard = shard
 
-        await self.get_or_load_tokenizer(shard.model_id)
+        await self.get_or_load_tokenizer(model_id)
 
         tokens = await self.encode(shard, prompt)
 
