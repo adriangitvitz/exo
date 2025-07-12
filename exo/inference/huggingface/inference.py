@@ -305,25 +305,38 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             layers = self.model_shards[shard]
             batch_size, seq_len = x.shape[:2]
 
+            # Get the model's dtype from the first layer
+            model_dtype = next(layers.parameters()).dtype
+
+            # Ensure input tensor matches model dtype
+            x = x.to(dtype=model_dtype)
+
+            # Create position_ids with matching dtype
             position_ids = torch.arange(seq_len, dtype=torch.long, device=x.device)
             position_ids = position_ids.unsqueeze(0).expand(batch_size, seq_len)
 
-            attention_mask = torch.ones(
-                batch_size, seq_len, dtype=torch.bool, device=x.device
-            )
-
+            # Create causal mask with matching dtype
             causal_mask = torch.triu(
-                torch.full((seq_len, seq_len), float("-inf"), device=x.device),
+                torch.full(
+                    (seq_len, seq_len),
+                    float("-inf"),
+                    device=x.device,
+                    dtype=model_dtype,
+                ),
                 diagonal=1,
             )
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(
+                0
+            )  # [1, 1, seq_len, seq_len]
             causal_mask = causal_mask.expand(batch_size, 1, seq_len, seq_len)
 
             for i, layer in enumerate(layers):
                 layer_name = layer.__class__.__name__
 
                 if DEBUG >= 3:
-                    print(f"Processing layer {i}: {layer_name}, input shape: {x.shape}")
+                    print(
+                        f"Processing layer {i}: {layer_name}, input shape: {x.shape}, dtype: {x.dtype}"
+                    )
 
                 if x is None:
                     raise ValueError(
@@ -334,6 +347,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                     if hasattr(layer, "forward"):
                         if "embed" in layer_name.lower():
                             x = layer(x.long())
+                            # Ensure embedding output matches model dtype
+                            x = x.to(dtype=model_dtype)
                         elif "norm" in layer_name.lower():
                             x = layer(x)
                         elif (
@@ -346,8 +361,9 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                             or "decoder" in layer_name.lower()
                         ):
                             try:
+                                # Ensure all inputs to decoder layer have matching dtype
                                 result = layer(
-                                    hidden_states=x,
+                                    hidden_states=x.to(dtype=model_dtype),
                                     attention_mask=causal_mask,
                                     position_ids=position_ids,
                                     past_key_value=None,
@@ -362,7 +378,11 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
                             except TypeError as e:
                                 if "unexpected keyword argument" in str(e):
-                                    result = layer(x, attention_mask=causal_mask)
+                                    # Fallback: minimal arguments with dtype consistency
+                                    result = layer(
+                                        x.to(dtype=model_dtype),
+                                        attention_mask=causal_mask,
+                                    )
                                     if isinstance(result, tuple):
                                         x = result[0]
                                     else:
@@ -370,14 +390,17 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                                 else:
                                     raise e
                         else:
+                            # Standard layer processing
                             result = layer(x)
                             if isinstance(result, tuple):
                                 x = result[0]
                             else:
                                 x = result
                     else:
+                        # Direct callable
                         x = layer(x)
 
+                    # Validate result
                     if x is None:
                         raise ValueError(f"Layer {i} ({layer_name}) returned None")
 
@@ -390,15 +413,23 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                     if DEBUG >= 1:
                         print(f"Error in layer {i} ({layer_name}): {e}")
                         print(f"Input shape: {x.shape if x is not None else 'None'}")
+                        print(f"Input dtype: {x.dtype if x is not None else 'None'}")
+                        print(f"Model dtype: {model_dtype}")
                         print(f"Layer type: {type(layer)}")
 
-                    if "shape" in str(e) and x is not None:
+                    # Enhanced error recovery with dtype consistency
+                    if "dtype" in str(e) and x is not None:
                         try:
+                            # Ensure correct dtype
+                            x = x.to(dtype=model_dtype)
+
+                            # Fix tensor dimensions if needed
                             if x.dim() < 2:
                                 x = x.unsqueeze(0)
                             elif x.dim() > 3:
                                 x = x.view(x.shape[0], x.shape[1], -1)
 
+                            # Retry the layer with corrected input
                             if "llamadecoderlayer" in layer_name.lower():
                                 result = layer(
                                     hidden_states=x,
