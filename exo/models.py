@@ -353,6 +353,7 @@ model_cards = {
         "layers": 36,
         "repo": {
             "MLXDynamicShardInferenceEngine": "mlx-community/Qwen2.5-3B-Instruct-4bit",
+            "HuggingFaceDistributedEngine": "Qwen/Qwen2.5-3B-Instruct",
         },
     },
     "qwen-2.5-coder-3b": {
