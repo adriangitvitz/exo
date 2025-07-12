@@ -79,20 +79,11 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         """Extract specific layers for the shard"""
         layers = nn.ModuleList()
 
-        # Enhanced debugging output
         if DEBUG >= 2:
             print(f"Model type: {type(model)}")
             print(f"Model class name: {model.__class__.__name__}")
-            if hasattr(model, "config"):
-                print(f"Model config type: {type(model.config)}")
-                print(
-                    f"Model architecture: {getattr(model.config, 'architectures', 'Unknown')}"
-                )
-                print(f"Model name: {getattr(model.config, 'model_type', 'Unknown')}")
 
-        # Enhanced Llama-style detection with multiple variants
         if hasattr(model, "model") and hasattr(model.model, "layers"):
-            # Standard Llama architecture (Llama-2, Llama-3, etc.)
             model_layers = model.model.layers
             embed_layer = getattr(model.model, "embed_tokens", None)
             norm_layer = getattr(model.model, "norm", None)
@@ -102,28 +93,8 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 print(
                     f"Detected Llama-style architecture with {len(model_layers)} layers"
                 )
-                print(f"Embed layer: {type(embed_layer) if embed_layer else 'None'}")
-                print(f"Norm layer: {type(norm_layer) if norm_layer else 'None'}")
-                print(f"LM head: {type(lm_head) if lm_head else 'None'}")
-
-        elif hasattr(model, "model") and hasattr(model.model, "h"):
-            # Alternative Llama structure variant
-            model_layers = model.model.h
-            embed_layer = getattr(model.model, "embed_tokens", None) or getattr(
-                model.model, "wte", None
-            )
-            norm_layer = getattr(model.model, "norm", None) or getattr(
-                model.model, "ln_f", None
-            )
-            lm_head = getattr(model, "lm_head", None)
-
-            if DEBUG >= 2:
-                print(
-                    f"Detected Llama-h-style architecture with {len(model_layers)} layers"
-                )
 
         elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-            # GPT-style architecture
             model_layers = model.transformer.h
             embed_layer = getattr(model.transformer, "wte", None)
             norm_layer = getattr(model.transformer, "ln_f", None)
@@ -133,124 +104,32 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 print(
                     f"Detected GPT-style architecture with {len(model_layers)} layers"
                 )
-
-        elif hasattr(model, "layers"):
-            # Direct layers access (some model variants)
-            model_layers = model.layers
-            embed_layer = getattr(model, "embed_tokens", None) or getattr(
-                model, "wte", None
-            )
-            norm_layer = getattr(model, "norm", None) or getattr(model, "ln_f", None)
-            lm_head = getattr(model, "lm_head", None)
-
-            if DEBUG >= 2:
-                print(
-                    f"Detected direct layers architecture with {len(model_layers)} layers"
-                )
-
-        # Additional fallback for complex model structures
-        elif hasattr(model, "model"):
-            # Try to find layers in nested model structure
-            model_obj = model.model
-            possible_layer_attrs = ["layers", "h", "decoder_layers", "encoder_layers"]
-
-            model_layers = None
-            for attr in possible_layer_attrs:
-                if hasattr(model_obj, attr):
-                    model_layers = getattr(model_obj, attr)
-                    if DEBUG >= 2:
-                        print(
-                            f"Found layers via fallback: {attr} with {len(model_layers)} layers"
-                        )
-                    break
-
-            if model_layers is None:
-                # Last resort - check what attributes the model actually has
-                available_attrs = [
-                    attr for attr in dir(model_obj) if not attr.startswith("_")
-                ]
-                raise ValueError(
-                    f"Could not find transformer layers in model {shard.model_id}. "
-                    f"Model.model attributes: {available_attrs[:10]}..."
-                )
-
-            # Find embedding and output layers
-            embed_layer = getattr(model_obj, "embed_tokens", None) or getattr(
-                model_obj, "wte", None
-            )
-            norm_layer = getattr(model_obj, "norm", None) or getattr(
-                model_obj, "ln_f", None
-            )
-            lm_head = getattr(model, "lm_head", None)
-
         else:
-            # Enhanced error with detailed model information
             available_attrs = [attr for attr in dir(model) if not attr.startswith("_")]
-            model_structure = {}
-
-            # Analyze model structure
-            for attr in ["model", "transformer", "layers"]:
-                if hasattr(model, attr):
-                    nested_obj = getattr(model, attr)
-                    nested_attrs = [
-                        a for a in dir(nested_obj) if not a.startswith("_")
-                    ][:5]
-                    model_structure[attr] = (
-                        f"{type(nested_obj)} with attrs: {nested_attrs}"
-                    )
-
-            error_msg = (
+            raise ValueError(
                 f"Unsupported model architecture for {shard.model_id}. "
                 f"Model type: {type(model)}. "
-                f"Available attributes: {available_attrs[:15]}. "
-                f"Structure analysis: {model_structure}"
+                f"Available attributes: {available_attrs[:10]}..."
             )
 
-            # Add config information if available
-            if hasattr(model, "config"):
-                error_msg += f" Config: {model.config}"
-
-            raise ValueError(error_msg)
-
-        # Validate that we found the necessary components
         if not model_layers:
             raise ValueError(f"No transformer layers found in model {shard.model_id}")
 
-        if DEBUG >= 2:
-            print(f"Total layers found: {len(model_layers)}")
-            print(f"Shard range: {shard.start_layer} to {shard.end_layer}")
-
-        # Handle first layer (embeddings)
         if shard.is_first_layer() and embed_layer is not None:
             layers.append(embed_layer)
-            if DEBUG >= 3:
-                print(f"Added embedding layer: {type(embed_layer)}")
 
-        # Extract transformer layers for this shard
         start_idx = max(0, shard.start_layer)
         end_idx = min(len(model_layers), shard.end_layer + 1)
-
-        if DEBUG >= 2:
-            print(
-                f"Extracting layers {start_idx} to {end_idx - 1} from {len(model_layers)} total layers"
-            )
 
         for i in range(start_idx, end_idx):
             if i < len(model_layers):
                 layers.append(model_layers[i])
-                if DEBUG >= 3:
-                    print(f"Added layer {i}: {type(model_layers[i])}")
 
-        # Handle last layer (output projection)
         if shard.is_last_layer():
             if norm_layer is not None:
                 layers.append(norm_layer)
-                if DEBUG >= 3:
-                    print(f"Added norm layer: {type(norm_layer)}")
             if lm_head is not None:
                 layers.append(lm_head)
-                if DEBUG >= 3:
-                    print(f"Added LM head: {type(lm_head)}")
 
         if DEBUG >= 2:
             print(f"Total layers extracted for shard: {len(layers)}")
@@ -289,9 +168,16 @@ class HuggingFaceDistributedEngine(InferenceEngine):
         return await asyncio.get_running_loop().run_in_executor(self.executor, _decode)
 
     async def sample(
-        self, logits: np.ndarray, temperature: float = 0.8, top_p: float = 0.9
+        self,
+        logits: np.ndarray,
+        temperature: float = 0.8,
+        top_p: float = 0.9,
+        temp: float = None,
     ) -> np.ndarray:
         """Sample next token from logits with proper top-p sampling"""
+
+        if temp is not None:
+            temperature = temp
 
         def _sample():
             if isinstance(logits, np.ndarray):
@@ -311,7 +197,6 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                 logits_tensor = self._top_p_filtering(logits_tensor, top_p)
 
             probs = torch.softmax(logits_tensor, dim=-1)
-
             next_token = torch.multinomial(probs, num_samples=1)
 
             return next_token.numpy()
@@ -335,6 +220,21 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
         return logits
 
+    async def infer_prompt(
+        self,
+        request_id: str,
+        shard: Shard,
+        prompt: str,
+        inference_state: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
+        """Infer from a text prompt"""
+        tokens = await self.encode(shard, prompt)
+
+        if tokens.ndim == 1:
+            tokens = tokens.reshape(1, -1)
+
+        return await self.infer_tensor(request_id, shard, tokens, inference_state)
+
     async def infer_tensor(
         self,
         request_id: str,
@@ -349,10 +249,16 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             inference_state = {}
 
         def _infer():
+            if input_data is None:
+                raise ValueError(f"Input data is None for shard {shard}")
+
             if isinstance(input_data, np.ndarray):
                 x = torch.from_numpy(input_data).to(self.device)
             else:
                 x = input_data.to(self.device)
+
+            if x is None:
+                raise ValueError(f"Converted tensor is None for shard {shard}")
 
             layers = self.model_shards[shard]
 
@@ -361,6 +267,11 @@ class HuggingFaceDistributedEngine(InferenceEngine):
 
                 if DEBUG >= 3:
                     print(f"Processing layer {i}: {layer_name}, input shape: {x.shape}")
+
+                if x is None:
+                    raise ValueError(
+                        f"Tensor became None before layer {i} ({layer_name})"
+                    )
 
                 if hasattr(layer, "forward"):
                     if "embed" in layer_name.lower():
@@ -379,15 +290,22 @@ class HuggingFaceDistributedEngine(InferenceEngine):
                         except Exception as e:
                             if DEBUG >= 1:
                                 print(f"Error in layer {i} ({layer_name}): {e}")
-                            seq_len = x.shape[1]
-                            attention_mask = torch.ones(
-                                x.shape[0], seq_len, device=x.device
-                            )
-                            x = layer(x, attention_mask=attention_mask)
-                            if isinstance(x, tuple):
-                                x = x[0]
+                            try:
+                                seq_len = x.shape[1]
+                                attention_mask = torch.ones(
+                                    x.shape[0], seq_len, device=x.device
+                                )
+                                x = layer(x, attention_mask=attention_mask)
+                                if isinstance(x, tuple):
+                                    x = x[0]
+                            except Exception as e2:
+                                print(f"Failed to recover from layer error: {e2}")
+                                raise e
                 else:
                     x = layer(x)
+
+                if x is None:
+                    raise ValueError(f"Layer {i} ({layer_name}) returned None")
 
             return x.cpu().numpy()
 
@@ -395,6 +313,10 @@ class HuggingFaceDistributedEngine(InferenceEngine):
             output_data = await asyncio.get_running_loop().run_in_executor(
                 self.executor, _infer
             )
+
+            # Final validation
+            if output_data is None:
+                raise ValueError(f"Final output is None for shard {shard}")
 
             return output_data, inference_state
 
